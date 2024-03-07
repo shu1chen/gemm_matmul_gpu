@@ -1,0 +1,6 @@
+[submodule "libs/oneDNN"]
+	path = libs/oneDNN
+	url = https://github.com/oneapi-src/oneDNN
+[submodule "libs/xetla"]
+	path = libs/xetla
+	url = https://https://github.com/intel/xetla
