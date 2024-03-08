@@ -222,9 +222,6 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices, const siz
 
 int main(int argc, char const *argv[])
 {
-
-	// auto status = dnnl_set_max_cpu_isa(dnnl_cpu_isa_avx512_core);
-
 	size_t align = 64;
 
 	int iterations = 100;
