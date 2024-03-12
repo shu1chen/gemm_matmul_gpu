@@ -25,6 +25,5 @@ If you have [Intel MKL](https://software.intel.com/content/www/us/en/develop/too
 
 ## Usage
 ```
-./gemm_matmul_gpu [iterations=1000] [arch=any] [align=64]
+./gemm_matmul_gpu [iterations=1000]
 ```
-align - specifies the alignment (bytes). Must be a valid alignment (valid for aligned_alloc, align > 32)

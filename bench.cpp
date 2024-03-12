@@ -66,7 +66,7 @@ std::string generateTimestamp()
 	return std::string(timestamp);
 }
 
-void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices, const size_t align)
+void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices)
 {
 #ifdef WITH_MKL
 	if (myarch.mkl_ >= 0)
@@ -173,10 +173,6 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices, const siz
 
 			// DNNL matmul
 			{
-				alloc::AlignedVector<float> A_DNNL_MATMUL(M * K, align);
-				alloc::AlignedVector<float> B_DNNL_MATMUL(K * N, align);
-				alloc::AlignedVector<float> C_DNNL_MATMUL(M * N, align);
-
 				// Write data to memory object's handles.
 				std::copy(kenneth_a_tmp.data(), kenneth_a_tmp.data() + kenneth_a_tmp.size(), static_cast<uint8_t *>(a_in_mem.get_data_handle()));
 				std::copy(kenneth_b_tmp.data(), kenneth_b_tmp.data() + kenneth_b_tmp.size(), static_cast<uint8_t *>(b_in_mem.get_data_handle()));
@@ -208,8 +204,6 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices, const siz
 			std::cout << "                  MKL gemm took: " << mkl_cblas_sgemm_duration_loop.count() * 10e6 / iterations << " ms." << std::endl;
 #endif
 
-		std::cout << "Alignment was: " << align << "." << std::endl;
-
 		outFile << M << "x" << K << "x" << N << "," << iterations << ","
 				<< dnnl_matmul_duration_loop.count() * 10e6 / iterations << ","
 				<< mkl_cblas_sgemm_duration_loop.count() * 10e6 / iterations << ","
@@ -222,26 +216,18 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices, const siz
 
 int main(int argc, char const *argv[])
 {
-	size_t align = 64;
-
 	int iterations = 100;
 	if (argc == 1)
 	{
 		iterations = 100;
-		align = 64;
 	}
 	else if (argc == 2)
 	{
 		iterations = std::atoi(argv[1]);
 	}
-	else if (argc == 3)
-	{
-		iterations = std::atoi(argv[1]);
-		align = std::atoi(argv[2]);
-	}
 	else
 	{
-		std::cerr << "Usage: " << argv[0] << " [iterations=100] [align=64]" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " [iterations=100] " << std::endl;
 		std::exit(1);
 	}
 
@@ -256,7 +242,7 @@ int main(int argc, char const *argv[])
 		{200, 256, 256},
 		{1, 64, 8}};
 
-	benchmarkLoop(iterations, matrices, align);
+	benchmarkLoop(iterations, matrices);
 
 	return 0;
 }
