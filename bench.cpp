@@ -2,20 +2,38 @@
 #include <vector>
 
 #include <iostream>
-#include "oneapi/dnnl/dnnl.hpp"
 #include <chrono>
-
 #include <unordered_map>
 
 #include <fstream>
 
-#ifdef WITH_MKL
+#include <sycl/sycl.hpp>
 #include <mkl.h>
-#endif
+#include "oneapi/mkl/blas.hpp"
+#include "oneapi/dnnl/dnnl.hpp"
 
 using namespace dnnl;
 using tag = memory::format_tag;
 using dt = memory::data_type;
+
+//
+// Random initialization of scalar, vector, general matrix and triangular matrix
+//
+template <typename fp> fp rand_scalar() { return fp(std::rand()) / fp(RAND_MAX) - fp(0.5); }
+template <typename fp> fp rand_scalar(int mag) { fp tmp = fp(mag) + fp(std::rand()) / fp(RAND_MAX) - fp(0.5); if (std::rand() % 2) return tmp; else return -tmp; }
+
+template <typename fp> void rand_matrix(fp *M, oneapi::mkl::transpose trans, int m, int n, int ld)
+{
+    if (trans == oneapi::mkl::transpose::nontrans) {
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < m; i++)
+                M[i + j * ld] = rand_scalar<fp>();
+    } else {
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+                M[j + i * ld] = rand_scalar<fp>();
+    }
+}
 
 void printDNNLStatus(dnnl_status_t &status)
 {
@@ -66,13 +84,9 @@ std::string generateTimestamp()
 	return std::string(timestamp);
 }
 
-void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices)
+template <typename fp>
+void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices, const sycl::device &dev)
 {
-#ifdef WITH_MKL
-	if (myarch.mkl_ >= 0)
-		mkl_enable_instructions(myarch.mkl_);
-#endif
-
 	std::chrono::duration<double> dnnl_matmul_duration_loop = std::chrono::duration<double>::zero();
 	std::chrono::duration<double> mkl_cblas_sgemm_duration_loop = std::chrono::duration<double>::zero();
 
@@ -88,50 +102,75 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices)
 
 	for (auto &&sizes : matrices)
 	{
-
-		char offsetc = 'F';
-		bool zero_oa = 1;
-		bool zero_ob = 1;
-		bool zero_oc = 0;
-		char transA = 'N';
-		char transB = 'N';
+		oneapi::mkl::transpose transA = oneapi::mkl::transpose::nontrans;
+		oneapi::mkl::transpose transB = oneapi::mkl::transpose::nontrans;
+		oneapi::mkl::transpose transC = oneapi::mkl::transpose::nontrans;
 		const int M = sizes.M;
 		const int K = sizes.K;
 		const int N = sizes.N;
-		float alpha = 1;
-		float beta = 1;
+		fp alpha = 1;
+		fp beta = 1;
 		int lda = K;
 		int ldb = N;
 		int ldc = N;
-		int8_t oa = 0;
-		int8_t ob = 0;
-		std::array<int32_t, 1> oc = {0};
+
+		// Catch asynchronous exceptions
+		auto exception_handler = [] (sycl::exception_list exceptions) {
+			for (std::exception_ptr const& e : exceptions) {
+				try {
+					std::rethrow_exception(e);
+				} catch(sycl::exception const& e) {
+					std::cout << "Caught asynchronous SYCL exception during GEMM:\n"
+					<< e.what() << std::endl;
+				}
+			}
+		};
+
+		// create execution queue and buffers of matrix data
+		sycl::queue queue(dev, exception_handler);
+		sycl::event gemm_done;
+		std::vector<sycl::event> gemm_dependencies;
+		sycl::context cxt = queue.get_context();
+
+		// https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2024-0/gemm.html
+		// Row major
+		int sizea = ldA * M;
+		int sizeb = ldB * K;
+		int sizec = ldC * M;
+		auto A = (fp *)malloc_shared(sizea * sizeof(fp), dev, cxt);
+		auto B = (fp *)malloc_shared(sizeb * sizeof(fp), dev, cxt);
+		auto C = (fp *)malloc_shared(sizec * sizeof(fp), dev, cxt);
 
 		//// DNNL Matmul
+		// https://oneapi-src.github.io/oneDNN/dev_guide_dpcpp_interoperability.html
 		// Create execution dnnl::engine.
-		dnnl::engine engine(engine::kind::gpu, 0);
+		dnnl::engine engine = dnnl::sycl_interop::make_engine(dev, cxt);
 		// Create dnnl::stream.
-		dnnl::stream engine_stream(engine);
+		dnnl::stream strm(engine);
 		// Source (A), weights (B), and destination (C) matrix dimensions.
 		memory::dims a_dims = {M, K};
 		memory::dims b_dims = {K, N};
 		memory::dims c_dims = {M, N};
-		memory::data_type type = dt::f32;
+		memory::data_type type = fp;
 		// Create memory descriptors and memory objects for src, weights, bias, and dst.
 		auto a_md = memory::desc(a_dims, type, tag::any);
 		auto b_md = memory::desc(b_dims, type, tag::any);
 		auto c_md = memory::desc(c_dims, type, tag::any);
 		auto a_in_md = memory::desc(a_dims, type, tag::ab);
 		auto b_in_md = memory::desc(b_dims, type, tag::ab);
-		auto a_in_mem = memory(a_in_md, engine);
-		auto b_in_mem = memory(b_in_md, engine);
+
+		auto a_in_mem = sycl_interop::make_memory(
+            a_in_md, engine, sycl_interop::memory_kind::usm, A);
+		auto b_in_mem = sycl_interop::make_memory(
+            b_in_md, engine, sycl_interop::memory_kind::usm, B);
+
 		// Create primitive descriptor.
 		auto matmul_pd = matmul::primitive_desc(engine, a_md, b_md, c_md);
 		// Repack and convert input data.
 		auto a_mem = memory(matmul_pd.src_desc(), engine);
-		reorder(a_in_mem, a_mem).execute(engine_stream, a_in_mem, a_mem);
+		reorder(a_in_mem, a_mem).execute(strm, a_in_mem, a_mem);
 		auto b_mem = memory(matmul_pd.weights_desc(), engine);
-		reorder(b_in_mem, b_mem).execute(engine_stream, b_in_mem, b_mem);
+		reorder(b_in_mem, b_mem).execute(strm, b_in_mem, b_mem);
 		auto c_mem = memory(matmul_pd.dst_desc(), engine);
 		// Create the primitive.
 		auto matmul_prim = matmul(matmul_pd);
@@ -143,44 +182,34 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices)
 
 		for (int i = 0; i < iterations + 1; i++)
 		{
-#ifdef WITH_MKL
-			if (use_fp32)
+			// Write data to memory object's handles.
+			rand_matrix(A, transA, M, K, ldA);
+			rand_matrix(B, transB, K, N, ldB);
+			rand_matrix(C, transC, M, N, ldC);
+
 			{ // MKL cblas_sgemm
-				alloc::AlignedVector<float> A_MKL(M * K, align);
-				alloc::AlignedVector<float> B_MKL(K * N, align);
-				alloc::AlignedVector<float> C_MKL(M * N, align);
-
-				std::copy(kenneth_a_tmp.data(), kenneth_a_tmp.data() + kenneth_a_tmp.size(), A_MKL.get());
-				std::copy(kenneth_b_tmp.data(), kenneth_b_tmp.data() + kenneth_b_tmp.size(), B_MKL.get());
-				std::copy(C.data(), C.data() + C.size(), C_MKL.get());
-
 				auto mkl_start = std::chrono::system_clock::now();
-				cblas_sgemm(CblasRowMajor,
-							transA == 'N' ? CblasNoTrans : CblasTrans,
-							transB == 'N' ? CblasNoTrans : CblasTrans,
-							/*CblasFixOffset,*/
-							M, N, K,
-							alpha,
-							A_MKL.get(), lda, // oa,
-							B_MKL.get(), ldb, // ob,
-							beta,
-							C_MKL.get(), ldc); // oc.data());
-				auto mkl_end = std::chrono::system_clock::now();
+
+				// add oneapi::mkl::blas::gemm to execution queue
+				try {
+					gemm_done = oneapi::mkl::blas::gemm(queue, transA, transB, M, N, K, alpha, A, ldA, B, ldB, beta, C, ldC, gemm_dependencies);
+				}
+				catch(sycl::exception const& e) {
+					std::cout << "\t\tCaught synchronous SYCL exception during GEMM:\n"
+							<< e.what() << std::endl << "OpenCL status: " << get_error_code(e) << std::endl;
+				}
+
+				gemm_done.wait();
 
 				mkl_cblas_sgemm_duration_loop += (mkl_end - mkl_start);
 			}
-#endif
 
 			// DNNL matmul
 			{
-				// Write data to memory object's handles.
-				std::copy(kenneth_a_tmp.data(), kenneth_a_tmp.data() + kenneth_a_tmp.size(), static_cast<uint8_t *>(a_in_mem.get_data_handle()));
-				std::copy(kenneth_b_tmp.data(), kenneth_b_tmp.data() + kenneth_b_tmp.size(), static_cast<uint8_t *>(b_in_mem.get_data_handle()));
-
 				auto dnnl_matmul_start = std::chrono::system_clock::now();
 
-				matmul_prim.execute(engine_stream, matmul_args);
-				engine_stream.wait();
+				matmul_prim.execute(strm, matmul_args);
+				strm.wait();
 
 				auto dnnl_matmul_end = std::chrono::system_clock::now();
 
@@ -199,15 +228,14 @@ void benchmarkLoop(int iterations, std::vector<matrix_size> &matrices)
 		std::cout << sizes << " in loop, for " << iterations << " iterations, avg:" << std::endl;
 
 		std::cout << "               DNNL matmul took: " << dnnl_matmul_duration_loop.count() * 10e6 / iterations << " ms." << std::endl;
-#ifdef WITH_MKL
-		if (use_fp32)
-			std::cout << "                  MKL gemm took: " << mkl_cblas_sgemm_duration_loop.count() * 10e6 / iterations << " ms." << std::endl;
-#endif
+		std::cout << "                  MKL gemm took: " << mkl_cblas_sgemm_duration_loop.count() * 10e6 / iterations << " ms." << std::endl;
 
 		outFile << M << "x" << K << "x" << N << "," << iterations << ","
 				<< dnnl_matmul_duration_loop.count() * 10e6 / iterations << ","
 				<< mkl_cblas_sgemm_duration_loop.count() * 10e6 / iterations << ","
 				<< std::endl;
+
+		mkl_free_buffers();
 	}
 
 	outFile.close();
@@ -242,7 +270,14 @@ int main(int argc, char const *argv[])
 		{200, 256, 256},
 		{1, 64, 8}};
 
-	benchmarkLoop(iterations, matrices);
+	sycl::device my_dev = sycl::device(sycl::gpu_selector_v);
+
+	std::cout << "On GPU. Running with single precision real data type:" << std::endl;
+	benchmarkLoop<float>(iterations, matrices, my_dev);
+	if (my_dev.get_info<sycl::info::device::double_fp_config>().size() != 0) {
+	    std::cout << "On GPU. Running with double precision real data type:" << std::endl;
+	    benchmarkLoop<double>(iterations, matrices, my_dev);
+	}
 
 	return 0;
 }

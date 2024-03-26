@@ -1,3 +1,5 @@
+# Unfinished, not working properly yet!
+
 # gemm_matmul bench on GPU
 Inspired by [gemmBench on CPU](https://github.com/shu1chen/gemmBench). Dependencies: [oneDNN](https://github.com/oneapi-src/oneDNN) and [XeTLA](https://https://github.com/intel/xetla)
 
